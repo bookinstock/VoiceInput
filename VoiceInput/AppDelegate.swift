@@ -13,6 +13,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     private var statusBarItem: NSStatusItem?
     private var popover: NSPopover?
     
+    /// Store the previously active application before showing the panel
+    private var previousApp: NSRunningApplication?
+    
     let speechRecognizer = SpeechRecognizer()
     let hotKeyManager = HotKeyManager.shared
     let textInputSimulator = TextInputSimulator.shared
@@ -37,12 +40,29 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
             guard let self = self else { return }
             let text = self.floatingPanel.transcribedText
             if !text.isEmpty {
-                print("Confirm: typing text")
+                print("Confirm: typing text '\(text)'")
+                
+                // Stop recording and reset state first
+                self.speechRecognizer.stopRecording()
+                self.isRecording = false
+                self.updateStatusBarIcon(isRecording: false)
+                self.statusText = "就绪"
+                
+                // Hide the panel
                 self.floatingPanel.hide()
                 
-                // Small delay to let the panel close
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                    self.textInputSimulator.insertTextViaClipboard(text)
+                // Restore focus to previous app and insert text
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                    // Activate the previous app to restore focus
+                    if let previousApp = self.previousApp {
+                        print("Restoring focus to: \(previousApp.localizedName ?? "unknown")")
+                        previousApp.activate(options: [])
+                    }
+                    
+                    // Wait a bit for the app to activate, then paste
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                        self.textInputSimulator.insertTextViaClipboard(text)
+                    }
                 }
             }
         }
@@ -50,8 +70,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         // Cancel button - discard and close
         floatingPanel.onCancel = { [weak self] in
             print("Cancel: discarding text")
-            self?.floatingPanel.hide()
             self?.speechRecognizer.stopRecording()
+            self?.isRecording = false
+            self?.updateStatusBarIcon(isRecording: false)
+            self?.statusText = "就绪"
+            self?.floatingPanel.hide()
+            
+            // Restore focus to previous app
+            if let previousApp = self?.previousApp {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                    previousApp.activate(options: [])
+                }
+            }
         }
     }
     
@@ -234,6 +264,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
             return
         }
         
+        // Save the currently active application before showing the panel
+        previousApp = NSWorkspace.shared.frontmostApplication
+        print("Saved previous app: \(previousApp?.localizedName ?? "none")")
+        
         isRecording = true
         statusText = "录音中..."
         updateStatusBarIcon(isRecording: true)
@@ -264,10 +298,34 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
         statusText = "处理中..."
         updateStatusBarIcon(isRecording: false)
         
-        // Don't hide floating panel - wait for user to click confirm or cancel
         floatingPanel.isRecording = false
-        
         speechRecognizer.stopRecording()
+        
+        // Auto-confirm: if there's text, paste it automatically
+        let text = floatingPanel.transcribedText
+        if !text.isEmpty {
+            print("Auto-confirm: typing text '\(text)'")
+            
+            // Hide the panel
+            floatingPanel.hide()
+            statusText = "就绪"
+            
+            // Restore focus to previous app and insert text
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+                guard let self = self else { return }
+                
+                // Activate the previous app to restore focus
+                if let previousApp = self.previousApp {
+                    print("Restoring focus to: \(previousApp.localizedName ?? "unknown")")
+                    previousApp.activate(options: [.activateIgnoringOtherApps])
+                }
+                
+                // Wait for the app to activate, then paste
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                    self.textInputSimulator.insertTextViaClipboard(text)
+                }
+            }
+        }
     }
     
     // MARK: - Permissions

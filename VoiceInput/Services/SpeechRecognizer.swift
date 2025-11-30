@@ -158,6 +158,12 @@ class SpeechRecognizer: NSObject, ObservableObject {
             return
         }
         
+        // Check if any microphone is available
+        guard AVCaptureDevice.default(for: .audio) != nil else {
+            updateState(.error("未找到麦克风设备"))
+            return
+        }
+        
         print("Speech recognition authorized: \(speechStatus == .authorized)")
         print("Microphone authorized: \(micStatus == .authorized)")
         
@@ -167,15 +173,31 @@ class SpeechRecognizer: NSObject, ObservableObject {
             recognitionTask = nil
         }
         
-        // Reset audio engine if needed
+        // Clean up audio engine if needed
         if audioEngine.isRunning {
             audioEngine.stop()
+        }
+        if audioEngine.inputNode.numberOfInputs > 0 {
             audioEngine.inputNode.removeTap(onBus: 0)
         }
-        audioEngine.reset()
         
         updateState(.preparing)
         transcribedText = ""
+        
+        // Configure the microphone input
+        let inputNode = audioEngine.inputNode
+        
+        // IMPORTANT: We must use the hardware's native format for the tap
+        // The tap format MUST match the hardware format - we cannot override it
+        let recordingFormat = inputNode.outputFormat(forBus: 0)
+        
+        print("Using hardware format: \(recordingFormat)")
+        
+        // Validate hardware format
+        guard recordingFormat.sampleRate > 0 && recordingFormat.channelCount > 0 else {
+            updateState(.error("无效的硬件音频格式"))
+            return
+        }
         
         // Create recognition request
         recognitionRequest = SFSpeechAudioBufferRecognitionRequest()
@@ -188,10 +210,10 @@ class SpeechRecognizer: NSObject, ObservableObject {
         recognitionRequest.shouldReportPartialResults = true
         recognitionRequest.taskHint = .dictation
         
-        // Use server-based recognition (more reliable)
+        // Use server-based recognition (more reliable) and enable auto-punctuation
         if #available(macOS 13.0, *) {
             recognitionRequest.requiresOnDeviceRecognition = false
-            recognitionRequest.addsPunctuation = true
+            recognitionRequest.addsPunctuation = AppSettings.shared.autoPunctuation
         }
         
         // Start recognition task
@@ -203,6 +225,55 @@ class SpeechRecognizer: NSObject, ObservableObject {
         print("Starting recognition task with language: \(currentLanguage.rawValue)")
         print("Speech recognizer available: \(speechRecognizer.isAvailable)")
         
+        // Install tap on the input node using the hardware's native format
+        var bufferCount = 0
+        inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { [weak self] buffer, _ in
+            bufferCount += 1
+            
+            // Log audio level every 50 buffers (roughly every second) to verify audio input
+            if bufferCount % 50 == 0 {
+                let channelData = buffer.floatChannelData?[0]
+                let frameLength = Int(buffer.frameLength)
+                
+                if let channelData = channelData {
+                    var sum: Float = 0
+                    var peak: Float = 0
+                    for i in 0..<frameLength {
+                        let sample = abs(channelData[i])
+                        sum += sample
+                        peak = max(peak, sample)
+                    }
+                    let avgLevel = sum / Float(frameLength)
+                    
+                    // Convert to rough dB scale
+                    let avgDb = 20 * log10(max(avgLevel, 0.00001))
+                    let peakDb = 20 * log10(max(peak, 0.00001))
+                    
+                    print("🎤 Audio input - Avg: \(String(format: "%.1f", avgDb)) dB, Peak: \(String(format: "%.1f", peakDb)) dB (frames: \(frameLength))")
+                    
+                    if peak < 0.01 {
+                        print("⚠️ Audio level very low - speak louder or check microphone!")
+                    }
+                }
+            }
+            
+            self?.recognitionRequest?.append(buffer)
+        }
+        
+        // Prepare and start the audio engine BEFORE starting the recognition task
+        audioEngine.prepare()
+        
+        do {
+            try audioEngine.start()
+            print("Audio engine started successfully")
+        } catch {
+            inputNode.removeTap(onBus: 0)
+            updateState(.error("无法启动音频引擎: \(error.localizedDescription)"))
+            delegate?.speechRecognizer(self, didEncounterError: error)
+            return
+        }
+        
+        // Now start the recognition task AFTER audio engine is running
         recognitionTask = speechRecognizer.recognitionTask(with: recognitionRequest) { [weak self] result, error in
             guard let self = self else { return }
             
@@ -235,9 +306,9 @@ class SpeechRecognizer: NSObject, ObservableObject {
                 if isFinal {
                     self.updateState(.idle)
                 } else if let error = error {
-                    // Check if it's a cancellation error (which is expected)
+                    // Check if it's a cancellation error or "no speech detected" (which is expected)
                     let nsError = error as NSError
-                    if nsError.domain == "kAFAssistantErrorDomain" && (nsError.code == 216 || nsError.code == 209 || nsError.code == 1101) {
+                    if nsError.domain == "kAFAssistantErrorDomain" && (nsError.code == 216 || nsError.code == 209 || nsError.code == 1101 || nsError.code == 1110) {
                         // Expected errors - user cancelled or no speech detected
                         print("Expected error, ignoring: \(nsError.code)")
                         self.updateState(.idle)
@@ -249,65 +320,7 @@ class SpeechRecognizer: NSObject, ObservableObject {
             }
         }
         
-        // Configure the microphone input
-        let inputNode = audioEngine.inputNode
-        
-        // Get the native format from the input node - use outputFormat for compatibility
-        let recordingFormat = inputNode.outputFormat(forBus: 0)
-        
-        // Check if format is valid
-        guard recordingFormat.sampleRate > 0 && recordingFormat.channelCount > 0 else {
-            // Try to create a standard format
-            guard let standardFormat = AVAudioFormat(standardFormatWithSampleRate: 44100, channels: 1) else {
-                updateState(.error("无法创建音频格式"))
-                return
-            }
-            
-            do {
-                inputNode.removeTap(onBus: 0)
-                inputNode.installTap(onBus: 0, bufferSize: 4096, format: standardFormat) { [weak self] buffer, _ in
-                    self?.recognitionRequest?.append(buffer)
-                }
-            } catch {
-                updateState(.error("无法配置音频输入: \(error.localizedDescription)"))
-                return
-            }
-            
-            audioEngine.prepare()
-            do {
-                try audioEngine.start()
-                updateState(.recording)
-            } catch {
-                inputNode.removeTap(onBus: 0)
-                updateState(.error("无法启动音频引擎: \(error.localizedDescription)"))
-            }
-            return
-        }
-        
-        // Remove any existing tap
-        inputNode.removeTap(onBus: 0)
-        
-        var bufferCount = 0
-        inputNode.installTap(onBus: 0, bufferSize: 4096, format: recordingFormat) { [weak self] buffer, _ in
-            self?.recognitionRequest?.append(buffer)
-            bufferCount += 1
-            if bufferCount % 50 == 0 {
-                print("Audio buffers received: \(bufferCount)")
-            }
-        }
-        
-        // Start the audio engine
-        audioEngine.prepare()
-        
-        do {
-            try audioEngine.start()
-            updateState(.recording)
-            print("Audio engine started successfully with format: \(recordingFormat)")
-        } catch {
-            inputNode.removeTap(onBus: 0)
-            updateState(.error("无法启动音频引擎: \(error.localizedDescription)"))
-            delegate?.speechRecognizer(self, didEncounterError: error)
-        }
+        updateState(.recording)
     }
     
     /// Stop recording
@@ -320,7 +333,11 @@ class SpeechRecognizer: NSObject, ObservableObject {
         if audioEngine.isRunning {
             audioEngine.stop()
         }
-        audioEngine.inputNode.removeTap(onBus: 0)
+        
+        // Safely remove tap only if it was installed
+        if audioEngine.inputNode.numberOfInputs > 0 {
+            audioEngine.inputNode.removeTap(onBus: 0)
+        }
         
         // End the audio input
         recognitionRequest?.endAudio()

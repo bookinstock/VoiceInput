@@ -1,6 +1,24 @@
 import SwiftUI
 import AppKit
 
+/// A panel that doesn't activate the app or steal focus but still accepts mouse events
+class NonActivatingPanel: NSPanel {
+    override var canBecomeKey: Bool { true }  // Need to be key to receive button clicks
+    override var canBecomeMain: Bool { false }
+    
+    override func resignKey() {
+        super.resignKey()
+        // Don't hide when losing key status
+    }
+}
+
+/// A hosting view that accepts first mouse click
+class FirstMouseHostingView<Content: View>: NSHostingView<Content> {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        return true
+    }
+}
+
 /// Floating panel window for recording feedback
 class FloatingPanelController: NSObject, ObservableObject {
     
@@ -82,10 +100,10 @@ class FloatingPanelController: NSObject, ObservableObject {
         
         let windowRect = NSRect(x: windowX, y: windowY, width: windowWidth, height: windowHeight)
         
-        // Create window
-        let window = NSWindow(
+        // Create a non-activating panel that doesn't steal focus
+        let window = NonActivatingPanel(
             contentRect: windowRect,
-            styleMask: [.borderless],
+            styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
         )
@@ -96,10 +114,11 @@ class FloatingPanelController: NSObject, ObservableObject {
         window.hasShadow = true
         window.isMovableByWindowBackground = true
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        window.hidesOnDeactivate = false
         
-        // Create SwiftUI view
+        // Create SwiftUI view with custom hosting view that accepts first mouse
         let contentView = FloatingPanelView(controller: self)
-        let hostingView = NSHostingView(rootView: contentView)
+        let hostingView = FirstMouseHostingView(rootView: contentView)
         hostingView.frame = NSRect(x: 0, y: 0, width: windowWidth, height: windowHeight)
         hostingView.autoresizingMask = [.width, .height]
         

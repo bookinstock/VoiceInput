@@ -40,11 +40,11 @@ class TextInputSimulator {
         print("Clipboard set success: \(success)")
         
         // Delay to ensure clipboard is ready
-        usleep(100000) // 100ms
+        usleep(150000) // 150ms
         
-        // Simulate Cmd+V
+        // Simulate Cmd+V using AppleScript (more reliable)
         print("Simulating Cmd+V...")
-        simulateKeyPress(keyCode: 9, modifiers: .maskCommand) // V key
+        simulatePaste()
         print("Cmd+V simulated")
         
         // Don't restore clipboard - let user keep the text
@@ -94,14 +94,36 @@ class TextInputSimulator {
         }
     }
     
-    /// Simulate a key press with modifiers
-    private func simulateKeyPress(keyCode: CGKeyCode, modifiers: CGEventFlags = []) {
-        let source = CGEventSource(stateID: .combinedSessionState)
+    /// Simulate a key press with modifiers using AppleScript (more reliable)
+    func simulatePaste() {
+        // Use AppleScript to simulate Cmd+V - this is more reliable than CGEvent
+        let script = """
+        tell application "System Events"
+            keystroke "v" using command down
+        end tell
+        """
+        
+        var error: NSDictionary?
+        if let scriptObject = NSAppleScript(source: script) {
+            scriptObject.executeAndReturnError(&error)
+            if let error = error {
+                print("AppleScript error: \(error)")
+                // Fall back to CGEvent method
+                simulateKeyPressCGEvent(keyCode: 9, modifiers: .maskCommand)
+            } else {
+                print("Paste simulated via AppleScript")
+            }
+        }
+    }
+    
+    /// Simulate a key press with modifiers using CGEvent (fallback)
+    private func simulateKeyPressCGEvent(keyCode: CGKeyCode, modifiers: CGEventFlags = []) {
+        let source = CGEventSource(stateID: .hidSystemState)
         
         // Key down with modifier
         if let keyDown = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: true) {
             keyDown.flags = modifiers
-            keyDown.post(tap: .cgSessionEventTap)
+            keyDown.post(tap: .cghidEventTap)
             print("Key down posted: \(keyCode)")
         } else {
             print("Failed to create key down event")
@@ -114,7 +136,7 @@ class TextInputSimulator {
         // Key up
         if let keyUp = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: false) {
             keyUp.flags = modifiers
-            keyUp.post(tap: .cgSessionEventTap)
+            keyUp.post(tap: .cghidEventTap)
             print("Key up posted: \(keyCode)")
         } else {
             print("Failed to create key up event")
